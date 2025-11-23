@@ -1,0 +1,1 @@
+# calls gen_data, train_rmi, run_benchmarks in the right order

@@ -1,0 +1,1 @@
+// round-trip: train → serialize → load

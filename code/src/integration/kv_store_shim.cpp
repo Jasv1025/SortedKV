@@ -1,0 +1,1 @@
+// Defines an abstract interface the learned index expects from the KV store

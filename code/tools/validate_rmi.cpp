@@ -1,0 +1,1 @@
+// prints error stats by calling src/index/validate
