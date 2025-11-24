@@ -1,0 +1,58 @@
+{
+    "num_keys": 10233,
+    "output": "data.txt",
+    "test": 0.2,
+    "validate": 0.2,
+    "components": [
+      {
+        "name": "Usernames",
+        "type": "stochastic",
+        "weight": 0.20,
+        "namespace": "user",
+        "namespace_sep": ":"
+      },
+      {
+        "name": "Sequential IDs",
+        "type": "sequential_ids",
+        "weight": 0.10,
+        "namespace": "id",
+        "namespace_sep": "-"
+      },
+      {
+        "name": "API Keys (Uniform)",
+        "type": "uniform",
+        "weight": 0.25,
+        "namespace": "",
+        "config": {
+          "length": { "min": 32, "max": 32 },
+          "charset": "alnum"
+        }
+      },
+      {
+        "name": "Product SKUs (Pareto)",
+        "type": "pareto",
+        "weight": 0.30,
+        "namespace": "sku",
+        "namespace_sep": "-",
+        "config": {
+          "b": 1.5,
+          "normalized": true,
+          "length": { "min": 8, "max": 12 },
+          "charset": "alnum_upper"
+        }
+      },
+      {
+        "name": "Tokens (Zipf)",
+        "type": "zipf",
+        "weight": 0.15,
+        "namespace": "tok",
+        "namespace_sep": ":",
+        "config": {
+          "a": 1.3,
+          "length": { "min": 12, "max": 128 },
+          "charset": "alnum_lower, digits"
+        }
+      }
+    ]
+  }
+  
