@@ -12,58 +12,54 @@
 #include <stdexcept>
 #include <memory>
 #include <functional>
+#include <variant>
 
-template <typename T>
-T read_pod(std::string_view view, size_t offset) {
-    if (offset + sizeof(T) > view.size()) {
-        throw std::out_of_range("Buffer overflow reading POD");
-    }
-    T val;
-    std::memcpy(&val, view.data() + offset, sizeof(T));
-    return val;
-}
-
-struct KV {
+enum class KeyType {
+    Bytes,
+    Integer
+};
+struct Blob {
     std::vector<uint8_t> k;
     std::vector<uint8_t> v;
-    
-    bool operator<(const KV& o) const {
-        return k < o.k;
-    }
 };
 
 class BlockLSMWriter {
 private:
-    static void flush_block(std::vector<KV>& batch, FILE* f, size_t block_size, size_t& current_overhead) {
+    static void flush_block(std::vector<Blob>& batch, FILE* f, size_t block_size, size_t& current_overhead) {
         if (batch.empty()) {
             return;
         }
         
         uint16_t count = static_cast<uint16_t>(batch.size());
-        uint16_t total_key_bytes = 0;
-        
-        for (const auto& b : batch) {
-            total_key_bytes += static_cast<uint16_t>(b.k.size());
-        }
 
+        std::vector<uint16_t> k_off;
+        std::vector<uint16_t> v_off;
+        k_off.reserve(count + 1);
+        v_off.reserve(count + 1);
+
+        k_off.push_back(0);
+        v_off.push_back(0);
+
+        uint16_t run_k = 0;
+        uint16_t run_v = 0;
+
+        for (const auto& b : batch) {
+            run_k += static_cast<uint16_t>(b.k.size());
+            k_off.push_back(run_k);
+
+            run_v += static_cast<uint16_t>(b.v.size());
+            v_off.push_back(run_v);
+        }
+        
+        uint16_t total_key_bytes = run_k;
+
+  
         fwrite(&count, sizeof(uint16_t), 1, f);
         fwrite(&total_key_bytes, sizeof(uint16_t), 1, f);
 
-        std::vector<uint16_t> k_lens;
-        std::vector<uint16_t> v_lens;
-        
-        k_lens.reserve(count);
-        v_lens.reserve(count);
 
-        for (const auto& b : batch) {
-            k_lens.push_back(static_cast<uint16_t>(b.k.size()));
-        }
-        for (const auto& b : batch) {
-            v_lens.push_back(static_cast<uint16_t>(b.v.size()));
-        }
-
-        fwrite(k_lens.data(), sizeof(uint16_t), count, f);
-        fwrite(v_lens.data(), sizeof(uint16_t), count, f);
+        fwrite(k_off.data(), sizeof(uint16_t), k_off.size(), f);
+        fwrite(v_off.data(), sizeof(uint16_t), v_off.size(), f);
 
         for (const auto& b : batch) {
             fwrite(b.k.data(), 1, b.k.size(), f);
@@ -72,10 +68,11 @@ private:
             fwrite(b.v.data(), 1, b.v.size(), f);
         }
 
-        size_t written = 4 + (count * 4) + total_key_bytes;
-        for (const auto& b : batch) {
-            written += b.v.size();
-        }
+        // Calculate Padding to fill the rest of the block
+        // Header (4) + K_Offsets + V_Offsets + K_Data + V_Data
+        size_t headers_sz = 4 + (k_off.size() * 2) + (v_off.size() * 2);
+        size_t data_sz = total_key_bytes + run_v;
+        size_t written = headers_sz + data_sz;
 
         if (written < block_size) {
             std::vector<uint8_t> pad(block_size - written, 0);
@@ -83,33 +80,49 @@ private:
         }
         
         batch.clear();
-        current_overhead = 4;
+        current_overhead = 8;
     }
 
 public:
     static void write(const std::string& filename, 
                       size_t block_size,
                       const std::vector<std::vector<uint8_t>>& keys, 
-                      const std::vector<std::vector<uint8_t>>& values) {
+                      const std::vector<std::vector<uint8_t>>& values,
+                      KeyType type = KeyType::Bytes) {
         
         if (keys.size() != values.size()) {
             throw std::runtime_error("Size mismatch between keys and values");
         }
 
-        std::vector<KV> data(keys.size());
+        std::vector<Blob> data(keys.size());
         for (size_t i = 0; i < keys.size(); i++) {
             data[i] = {keys[i], values[i]};
         }
-        
-        std::sort(data.begin(), data.end());
+
+        if (type == KeyType::Integer) {
+            std::sort(data.begin(), data.end(), [](const Blob& a, const Blob& b) {
+                if (a.k.size() != 8 || b.k.size() != 8) {
+                     return a.k < b.k;
+                }
+                uint64_t va;
+                uint64_t vb;
+                std::memcpy(&va, a.k.data(), 8);
+                std::memcpy(&vb, b.k.data(), 8);
+                return va < vb;
+            });
+        } else {
+            std::sort(data.begin(), data.end(), [](const Blob& a, const Blob& b) {
+                return a.k < b.k;
+            });
+        }
 
         std::unique_ptr<FILE, decltype(&fclose)> f(fopen(filename.c_str(), "wb"), &fclose);
         if (!f) {
             throw std::runtime_error("Failed to open file for writing");
         }
 
-        std::vector<KV> batch;
-        size_t current_overhead = 4;
+        std::vector<Blob> batch;
+        size_t current_overhead = 8;
 
         for (const auto& item : data) {
             size_t item_sz = 4 + item.k.size() + item.v.size();
@@ -136,13 +149,12 @@ private:
     int fd;
     size_t file_sz;
     size_t block_sz;
-    
     std::unique_ptr<char, std::function<void(char*)>> mmap_ptr;
 
 public:
     MmapBlockReader(const std::string& filename, size_t block_size) 
         : block_sz(block_size), mmap_ptr(nullptr, [](char*){}) {
-            
+        
         fd = open(filename.c_str(), O_RDONLY);
         if (fd == -1) {
             throw std::runtime_error("Open failed");
@@ -153,105 +165,110 @@ public:
             close(fd);
             throw std::runtime_error("Stat failed");
         }
+        
         file_sz = static_cast<size_t>(sb.st_size);
-
-        void* raw_ptr = mmap(nullptr, file_sz, PROT_READ, MAP_SHARED, fd, 0);
-        if (raw_ptr == MAP_FAILED) {
-            close(fd);
-            throw std::runtime_error("Mmap failed");
+        
+        void* ptr = mmap(nullptr, file_sz, PROT_READ, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) { 
+            close(fd); 
+            throw std::runtime_error("Mmap failed"); 
         }
 
-        size_t captured_size = file_sz;
-        mmap_ptr = std::unique_ptr<char, std::function<void(char*)>>(
-            static_cast<char*>(raw_ptr),
-            [captured_size](char* ptr) {
-                if (ptr) {
-                    munmap(ptr, captured_size);
-                }
+        auto deleter = [sz = file_sz](char* p) {
+            if (p) {
+                munmap(p, sz);
             }
-        );
+        };
+
+        mmap_ptr = std::unique_ptr<char, std::function<void(char*)>>((char*)ptr, deleter);
     }
 
-    ~MmapBlockReader() {
+    ~MmapBlockReader() { 
         if (fd != -1) {
-            close(fd);
+            close(fd); 
         }
     }
 
-    size_t num_blocks() const {
-        return file_sz / block_sz;
+    size_t num_blocks() const { 
+        return file_sz / block_sz; 
     }
 
     class BlockView {
     private:
         std::string_view view;
         uint16_t count;
-        uint16_t key_blob_sz;
+    
+        size_t k_offs_pos;
+        size_t v_offs_pos;
+        size_t k_blob_pos;
+        size_t v_blob_pos;
 
-        size_t k_lens_offset;
-        size_t v_lens_offset;
-        size_t k_blob_offset;
-        size_t v_blob_offset;
+        template <typename T>
+        T read_at(size_t offset) const {
+            if (offset + sizeof(T) > view.size()) {
+                 return T{}; 
+            }
+            T val;
+            std::memcpy(&val, view.data() + offset, sizeof(T));
+            return val;
+        }
 
     public:
         BlockView(std::string_view block_data) : view(block_data) {
-            count = read_pod<uint16_t>(view, 0);
-            key_blob_sz = read_pod<uint16_t>(view, 2);
-
-            k_lens_offset = 4;
-            v_lens_offset = 4 + (static_cast<size_t>(count) * 2);
-            k_blob_offset = v_lens_offset + (static_cast<size_t>(count) * 2);
-            v_blob_offset = k_blob_offset + key_blob_sz;
+            count = read_at<uint16_t>(0);
+            uint16_t kblob_sz = read_at<uint16_t>(2);
+            
+            size_t offs_len = (static_cast<size_t>(count) + 1) * 2;
+            
+            k_offs_pos = 4;
+            v_offs_pos = k_offs_pos + offs_len;
+            k_blob_pos = v_offs_pos + offs_len;
+            v_blob_pos = k_blob_pos + kblob_sz;
         }
 
         uint16_t size() const { 
             return count; 
         }
 
-        uint64_t get_key_int(uint16_t idx) const {
+        template <typename T>
+        T get_key(uint16_t idx) const {
             if (idx >= count) {
-                return 0;
+                return T{};
             }
             
-            uint32_t blob_offset = 0;
-            for (int i = 0; i < idx; i++) {
-                blob_offset += read_pod<uint16_t>(view, k_lens_offset + (i * 2));
-            }
+            uint16_t start = read_at<uint16_t>(k_offs_pos + (idx * 2));
+            uint16_t end = read_at<uint16_t>(k_offs_pos + ((idx + 1) * 2));
             
-            uint16_t len = read_pod<uint16_t>(view, k_lens_offset + (idx * 2));
+            uint16_t len = end - start;
             
-            std::string_view key_view = view.substr(k_blob_offset + blob_offset, len);
+            T val = T{};
+            size_t copy_amount = std::min((size_t)len, sizeof(T));
             
-            uint64_t k = 0;
-            size_t copy_len = std::min(static_cast<size_t>(len), sizeof(uint64_t));
-            std::memcpy(&k, key_view.data(), copy_len);
+            std::memcpy(&val, view.data() + k_blob_pos + start, copy_amount);
             
-            return k;
+            return val;
         }
 
-        std::string get_val_str(uint16_t idx) const {
+        std::string get_val_string(uint16_t idx) const {
             if (idx >= count) {
                 return "";
             }
-
-            uint32_t blob_offset = 0;
-            for (int i = 0; i < idx; i++) {
-                blob_offset += read_pod<uint16_t>(view, v_lens_offset + (i * 2));
-            }
             
-            uint16_t len = read_pod<uint16_t>(view, v_lens_offset + (idx * 2));
-
-            return std::string(view.substr(v_blob_offset + blob_offset, len));
+            uint16_t start = read_at<uint16_t>(v_offs_pos + (idx * 2));
+            uint16_t end = read_at<uint16_t>(v_offs_pos + ((idx + 1) * 2));
+            
+            uint16_t len = end - start;
+            
+            return std::string(view.substr(v_blob_pos + start, len));
         }
     };
 
     BlockView get_block(size_t block_idx) const {
-        size_t offset = block_idx * block_sz;
-        if (offset >= file_sz) {
-            throw std::out_of_range("Block index out of bounds");
+        if (block_idx * block_sz >= file_sz) {
+            throw std::out_of_range("Block idx out of bounds");
         }
         
-        std::string_view sv(mmap_ptr.get() + offset, block_sz);
-        return BlockView(sv);
+        char* block_start = mmap_ptr.get() + (block_idx * block_sz);
+        return BlockView(std::string_view(block_start, block_sz));
     }
 };
