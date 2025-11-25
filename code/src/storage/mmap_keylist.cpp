@@ -185,7 +185,7 @@ private:
     size_t file_sz;
     size_t block_sz;
     std::unique_ptr<char, std::function<void(char*)>> mmap_ptr;
-    std::vector<BlockMetadata> metadata_cache;
+    std::vector<BlockMetadata> temp_metadata_cache;
 
     void load_metadata() {
         if (file_sz < 16) {
@@ -204,7 +204,7 @@ private:
         }
 
         char* curr = mmap_ptr.get() + meta_start;
-        metadata_cache.reserve(block_count);
+        temp_metadata_cache.reserve(block_count);
 
         for (uint64_t i = 0; i < block_count; i++) {
             BlockMetadata meta;
@@ -221,7 +221,7 @@ private:
             std::memcpy(meta.first_key.data(), curr, klen);
             curr += klen;
 
-            metadata_cache.push_back(std::move(meta));
+            temp_metadata_cache.push_back(std::move(meta));
         }
     }
 
@@ -263,15 +263,15 @@ public:
     }
 
     const std::vector<BlockMetadata>& get_block_list() const {
-        return metadata_cache;
+        return temp_metadata_cache;
     }
     std::vector<BlockMetadata> get_block_list_range(size_t start_index, size_t end_index) const {
-        if (start_index >= metadata_cache.size() || start_index >= end_index) {
+        if (start_index >= temp_metadata_cache.size() || start_index >= end_index) {
             return {};
         }
-        size_t clamped_end = std::min(end_index, metadata_cache.size());
-        auto start_it = metadata_cache.begin() + start_index;
-        auto end_it = metadata_cache.begin() + clamped_end;
+        size_t clamped_end = std::min(end_index, temp_metadata_cache.size());
+        auto start_it = temp_metadata_cache.begin() + start_index;
+        auto end_it = temp_metadata_cache.begin() + clamped_end;
         return std::vector<BlockMetadata>(start_it, end_it);
     }
 
